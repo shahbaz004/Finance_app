@@ -1,0 +1,89 @@
+# Android build for DevDeck: React Native + Gradle, no Expo EAS.
+# DevDeck starts this (workflow_dispatch) on an environment's deploy branch and reads the
+# `android-build` artifact: the .apk/.aab plus devdeck-build.json. See docs/android-ci.md.
+name: Android build
+run-name: Android build (${{ inputs.variant }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "apk = install directly, aab = for Google Play"
+        type: choice
+        options: [apk, aab]
+        default: apk
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      VARIANT: ${{ inputs.variant }}
+      RUN_NUMBER: ${{ github.run_number }}
+      VERSION_CODE_OFFSET: ${{ vars.VERSION_CODE_OFFSET || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Signing keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/upload.keystore"
+            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/upload.keystore" >> "$GITHUB_ENV"
+          else
+            echo "::warning::ANDROID_KEYSTORE_BASE64 not set — release build is signed with the debug key (not accepted by Play)."
+          fi
+
+      - name: Version
+        run: |
+          # job-level env would shadow $GITHUB_ENV, so VERSION_CODE is only ever set here
+          echo "VERSION_CODE=$((RUN_NUMBER + VERSION_CODE_OFFSET))" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=$(node -p "require('./app.json').expo.version")" >> "$GITHUB_ENV"
+
+      - name: Gradle build
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          task=$([ "$VARIANT" = aab ] && echo bundleRelease || echo assembleRelease)
+          ./gradlew "$task" -PversionCode="$VERSION_CODE" --no-daemon
+
+      - name: Collect artifact
+        run: |
+          mkdir -p dist
+          if [ "$VARIANT" = aab ]; then
+            cp android/app/build/outputs/bundle/release/*.aab dist/
+          else
+            cp android/app/build/outputs/apk/release/*.apk dist/
+          fi
+          node -e "require('fs').writeFileSync('dist/devdeck-build.json', JSON.stringify({platform: 'android', variant: process.env.VARIANT, versionName: process.env.VERSION_NAME, versionCode: Number(process.env.VERSION_CODE)}))"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-build
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error

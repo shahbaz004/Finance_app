@@ -1,0 +1,59 @@
+# Android build/release for DevDeck: React Native + Gradle, no Expo EAS. See docs/android-ci.md.
+# DevDeck starts a pipeline with DEVDECK_ANDROID=apk|aab. For AABs it later plays the manual
+# `android_release` job (PLAY_TRACK) to upload to Google Play.
+
+stages:
+  - build
+  - release
+
+android_build:
+  stage: build
+  image: reactnativecommunity/react-native-android:v21.1
+  rules:
+    - if: $DEVDECK_ANDROID
+  variables:
+    GRADLE_USER_HOME: $CI_PROJECT_DIR/.gradle-home
+  cache:
+    key: android-$CI_COMMIT_REF_SLUG
+    paths:
+      - .npm/
+      - .gradle-home/caches/
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - |
+      if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+        echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$CI_PROJECT_DIR/upload.keystore"
+        export ANDROID_KEYSTORE_PATH="$CI_PROJECT_DIR/upload.keystore"
+      else
+        echo "WARNING: ANDROID_KEYSTORE_BASE64 not set — release build is signed with the debug key (not accepted by Play)."
+      fi
+    - export VERSION_CODE=$((CI_PIPELINE_IID + ${VERSION_CODE_OFFSET:-0}))
+    - export VERSION_NAME=$(node -p "require('./app.json').expo.version")
+    - export VARIANT=$DEVDECK_ANDROID
+    - cd android && chmod +x gradlew
+    - if [ "$VARIANT" = aab ]; then TASK=bundleRelease; else TASK=assembleRelease; fi
+    - ./gradlew "$TASK" -PversionCode="$VERSION_CODE" --no-daemon
+    - cd .. && mkdir -p dist
+    - if [ "$VARIANT" = aab ]; then cp android/app/build/outputs/bundle/release/*.aab dist/; else cp android/app/build/outputs/apk/release/*.apk dist/; fi
+    - node -e "require('fs').writeFileSync('dist/devdeck-build.json', JSON.stringify({platform:'android',variant:process.env.VARIANT,versionName:process.env.VERSION_NAME,versionCode:Number(process.env.VERSION_CODE)}))"
+    - ls -l dist
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 14 days
+
+android_release:
+  stage: release
+  image: ruby:3.3
+  needs: [android_build]
+  rules:
+    - if: $DEVDECK_ANDROID == "aab"
+      when: manual
+      allow_failure: true
+  script:
+    - AAB=$(ls dist/*.aab 2>/dev/null | head -1)
+    - if [ -z "$AAB" ]; then echo "No .aab in the build artifact — start a Play Store (AAB) build."; exit 1; fi
+    - PKG=${ANDROID_PACKAGE_NAME:-$(sed -nE "s/^[[:space:]]*applicationId[[:space:]]+['\"]([^'\"]+)['\"].*/\1/p" android/app/build.gradle | head -1)}
+    - gem install fastlane --no-document
+    # release_status defaults to "completed"; add --release_status draft to review in Play Console first
+    - fastlane supply --aab "$AAB" --track "${PLAY_TRACK:-internal}" --package_name "$PKG" --json_key_data "$PLAY_SERVICE_ACCOUNT_JSON" --skip_upload_metadata true --skip_upload_images true --skip_upload_screenshots true
