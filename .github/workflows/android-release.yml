@@ -1,0 +1,66 @@
+# Upload a finished AAB build to Google Play. DevDeck starts this after approval and finds the
+# run by `devdeck_ref` in its run name, so keep it there. See docs/android-ci.md.
+name: Android release
+run-name: Android release ${{ inputs.track }} · ${{ inputs.devdeck_ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "Run id of the Android build (AAB) to upload"
+        required: true
+      track:
+        description: "Play track"
+        type: choice
+        options: [internal, alpha, beta, production]
+        default: internal
+      devdeck_ref:
+        description: "Set by DevDeck to track this run"
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-build
+          path: dist
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find AAB and package name
+        env:
+          ANDROID_PACKAGE_NAME: ${{ vars.ANDROID_PACKAGE_NAME }}
+        run: |
+          aab=$(ls dist/*.aab 2>/dev/null | head -1)
+          if [ -z "$aab" ]; then
+            echo "::error::Run ${{ inputs.build_run_id }} has no .aab — start a Play Store (AAB) build first."
+            exit 1
+          fi
+          pkg=${ANDROID_PACKAGE_NAME:-$(sed -nE "s/^[[:space:]]*applicationId[[:space:]]+['\"]([^'\"]+)['\"].*/\1/p" android/app/build.gradle | head -1)}
+          echo "AAB=$aab" >> "$GITHUB_ENV"
+          echo "PACKAGE_NAME=$pkg" >> "$GITHUB_ENV"
+          echo "Uploading $aab as $pkg"
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Upload to Google Play
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          gem install fastlane --no-document
+          # release_status defaults to "completed" (fine for internal/closed tracks);
+          # pass --release_status draft to review in Play Console before it goes out.
+          fastlane supply --aab "$AAB" --track "${{ inputs.track }}" \
+            --package_name "$PACKAGE_NAME" --json_key_data "$PLAY_SERVICE_ACCOUNT_JSON" \
+            --skip_upload_metadata true --skip_upload_images true --skip_upload_screenshots true
