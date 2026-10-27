@@ -1,0 +1,17 @@
+name: Internal build
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        type: choice
+        options: [all, ios, android]
+        default: all
+jobs:
+  build_android:
+    if: ${{ inputs.platform != 'ios' }}
+    type: build
+    params: { platform: android, profile: preview }
+  build_ios:
+    if: ${{ inputs.platform != 'android' }}
+    type: build
+    params: { platform: ios, profile: preview }
